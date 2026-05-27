@@ -130,55 +130,76 @@ struct Reduction {
 
     Eigen::Matrix<float, 29, 1, Eigen::DontAlign> values;
 
+    // Cache R and t into raw scalars to avoid Eigen Matrix-Matrix product on
+    // device (Eigen 3.3.x has __host__-only Assignment that NVCC silently
+    // calls from __device__ code, yielding undefined behavior).
+    const float R00 = R_prev_curr(0,0), R01 = R_prev_curr(0,1), R02 = R_prev_curr(0,2);
+    const float R10 = R_prev_curr(1,0), R11 = R_prev_curr(1,1), R12 = R_prev_curr(1,2);
+    const float R20 = R_prev_curr(2,0), R21 = R_prev_curr(2,1), R22 = R_prev_curr(2,2);
+    const float tx = t_prev_curr(0), ty = t_prev_curr(1), tz = t_prev_curr(2);
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
          i += blockDim.x * gridDim.x) {
       const int y = i / cols;
       const int x = i - (y * cols);
 
-      const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> v_curr(
-          vmap_curr.ptr(y)[x], vmap_curr.ptr(y + rows)[x],
-          vmap_curr.ptr(y + 2 * rows)[x]);
+      const float vcx = vmap_curr.ptr(y)[x];
+      const float vcy = vmap_curr.ptr(y + rows)[x];
+      const float vcz = vmap_curr.ptr(y + 2 * rows)[x];
 
-      const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> v_curr_in_prev =
-          R_prev_curr * v_curr + t_prev_curr;
+      // v_curr_in_prev = R * v_curr + t  (raw scalars)
+      const float vpx = R00 * vcx + R01 * vcy + R02 * vcz + tx;
+      const float vpy = R10 * vcx + R11 * vcy + R12 * vcz + ty;
+      const float vpz = R20 * vcx + R21 * vcy + R22 * vcz + tz;
 
-      const Eigen::Matrix<int, 2, 1, Eigen::DontAlign> p_curr_in_prev(
-          __float2int_rn(v_curr_in_prev(0) * intr.fx / v_curr_in_prev(2) +
-                         intr.cx),
-          __float2int_rn(v_curr_in_prev(1) * intr.fy / v_curr_in_prev(2) +
-                         intr.cy));
+      const int px = __float2int_rn(vpx * intr.fx / vpz + intr.cx);
+      const int py = __float2int_rn(vpy * intr.fy / vpz + intr.cy);
 
       float row[7] = {0, 0, 0, 0, 0, 0, 0};
 
       values[28] = 0;
 
-      if (p_curr_in_prev(0) >= 0 && p_curr_in_prev(1) >= 0 &&
-          p_curr_in_prev(0) < cols && p_curr_in_prev(1) < rows &&
-          v_curr(2) > 0 && v_curr_in_prev(2) > 0) {
-        const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> v_prev(
-            vmap_prev.ptr(p_curr_in_prev(1))[p_curr_in_prev(0)],
-            vmap_prev.ptr(p_curr_in_prev(1) + rows)[p_curr_in_prev(0)],
-            vmap_prev.ptr(p_curr_in_prev(1) + 2 * rows)[p_curr_in_prev(0)]);
+      if (px >= 0 && py >= 0 && px < cols && py < rows &&
+          vcz > 0 && vpz > 0) {
+        const float vprev_x = vmap_prev.ptr(py)[px];
+        const float vprev_y = vmap_prev.ptr(py + rows)[px];
+        const float vprev_z = vmap_prev.ptr(py + 2 * rows)[px];
 
-        const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> n_curr(
-            nmap_curr.ptr(y)[x], nmap_curr.ptr(y + rows)[x],
-            nmap_curr.ptr(y + 2 * rows)[x]);
+        const float ncx = nmap_curr.ptr(y)[x];
+        const float ncy = nmap_curr.ptr(y + rows)[x];
+        const float ncz = nmap_curr.ptr(y + 2 * rows)[x];
 
-        const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> n_curr_in_prev =
-            R_prev_curr * n_curr;
+        // n_curr_in_prev = R * n_curr
+        const float nipx = R00 * ncx + R01 * ncy + R02 * ncz;
+        const float nipy = R10 * ncx + R11 * ncy + R12 * ncz;
+        const float nipz = R20 * ncx + R21 * ncy + R22 * ncz;
 
-        const Eigen::Matrix<float, 3, 1, Eigen::DontAlign> n_prev(
-            nmap_prev.ptr(p_curr_in_prev(1))[p_curr_in_prev(0)],
-            nmap_prev.ptr(p_curr_in_prev(1) + rows)[p_curr_in_prev(0)],
-            nmap_prev.ptr(p_curr_in_prev(1) + 2 * rows)[p_curr_in_prev(0)]);
+        const float npx = nmap_prev.ptr(py)[px];
+        const float npy = nmap_prev.ptr(py + rows)[px];
+        const float npz = nmap_prev.ptr(py + 2 * rows)[px];
 
-        if (n_curr_in_prev.cross(n_prev).norm() < angle_thresh &&
-            (v_prev - v_curr_in_prev).norm() < dist_thresh &&
-            !isnan(n_curr(0)) && !isnan(n_prev(0))) {
-          *(Eigen::Matrix<float, 3, 1, Eigen::DontAlign> *)&row[0] = n_prev;
-          *(Eigen::Matrix<float, 3, 1, Eigen::DontAlign> *)&row[3] =
-              v_curr_in_prev.cross(n_prev);
-          row[6] = n_prev.dot(v_prev - v_curr_in_prev);
+        // cross(n_curr_in_prev, n_prev)
+        const float cx_ = nipy * npz - nipz * npy;
+        const float cy_ = nipz * npx - nipx * npz;
+        const float cz_ = nipx * npy - nipy * npx;
+        const float ncross = sqrtf(cx_*cx_ + cy_*cy_ + cz_*cz_);
+
+        // v_prev - v_curr_in_prev
+        const float dx = vprev_x - vpx;
+        const float dy = vprev_y - vpy;
+        const float dz = vprev_z - vpz;
+        const float dnorm = sqrtf(dx*dx + dy*dy + dz*dz);
+
+        if (ncross < angle_thresh && dnorm < dist_thresh &&
+            !isnan(ncx) && !isnan(npx)) {
+          // row[0..2] = n_prev
+          row[0] = npx; row[1] = npy; row[2] = npz;
+          // row[3..5] = cross(v_curr_in_prev, n_prev)
+          row[3] = vpy * npz - vpz * npy;
+          row[4] = vpz * npx - vpx * npz;
+          row[5] = vpx * npy - vpy * npx;
+          // row[6] = n_prev.dot(v_prev - v_curr_in_prev)
+          row[6] = npx * dx + npy * dy + npz * dz;
 
           values[28] = 1;
 
